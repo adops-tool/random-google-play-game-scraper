@@ -4,6 +4,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from google_play_scraper import app as get_app_details
 from google_play_scraper import search
@@ -447,21 +448,35 @@ def iter_games(app_ids: list[str], prefetched: dict[str, dict] | None = None):
 # ---------------------------------------------------------------------------
 # Persistence helpers (unchanged behavior)
 # ---------------------------------------------------------------------------
+_APP_ID = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
+
+
+def _app_id_from_url(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.netloc.lower() != "play.google.com":
+        return None
+    app_id = parse_qs(parsed.query).get("id", [None])[0]
+    return app_id if app_id and _APP_ID.fullmatch(app_id) else None
+
+
 def load_existing(path: Path) -> set[str]:
-    if not path.exists():
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
         return set()
-    seen: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if "id=" in line:
-            seen.add(line.rsplit("id=", 1)[-1])
-    return seen
+    return {app_id for line in lines if (app_id := _app_id_from_url(line))}
 
 
 def append_links(path: Path, app_ids: list[str]) -> None:
+    valid_ids = [app_id for app_id in app_ids if _APP_ID.fullmatch(app_id)]
+    if not valid_ids:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        for app_id in app_ids:
-            f.write(PLAY_URL.format(app_id=app_id) + "\n")
+        f.writelines(PLAY_URL.format(app_id=app_id) + "\n" for app_id in valid_ids)
 
 
 def init_sheet():
@@ -491,8 +506,9 @@ def main() -> None:
     sheet = init_sheet()
     if sheet:
         for url in sheet.existing:
-            if "id=" in url:
-                seen.add(url.rsplit("id=", 1)[-1])
+            app_id = _app_id_from_url(url)
+            if app_id:
+                seen.add(app_id)
 
     print(f"Already saved: {len(seen)}")
     print(f"Writing to {output}{' + Google Sheet' if sheet else ''}. Stop with Ctrl+C.\n")
