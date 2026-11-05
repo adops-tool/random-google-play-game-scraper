@@ -50,7 +50,7 @@ A high-throughput Python game discovery utility that continuously scrapes Google
 - Deduplication across sessions by loading previously collected app IDs from output artifacts.
 - Dual-sink output model:
   - Local text sink (`games.txt` by default).
-  - Optional Google Sheets sink (column `B`, append-only semantics, dedupe aware).
+  - Optional Google Sheets sink (column `A`, append-only semantics, deduplicated against existing values).
 - Locale diversification support via configurable `(language, country)` pairs.
 - Graceful shutdown behavior (`Ctrl+C`) that flushes buffered links before exiting.
 
@@ -75,22 +75,23 @@ A high-throughput Python game discovery utility that continuously scrapes Google
 ├── README.md
 ├── main.py                # Scraping loop, filtering, batching, and orchestration
 ├── settings.py            # Runtime and output configuration
-├── sheet.py               # Google Sheets adapter and dedupe-aware appender
-├── requirements.txt       # Python dependencies
+├── sheet.py               # Google Sheets adapter and deduplicated appender
+├── tests/                 # Offline unit tests
+├── requirements.txt       # Bounded dependency versions
 ├── games.txt              # Local output file (generated/updated at runtime)
-└── service_account.json   # Google service account credentials (user-provided)
+└── service_account.json   # Optional, locally supplied credentials (not committed)
 ```
 
 ### Key Design Decisions
 
-- **Infinite worker loop:** optimized for long-running collection sessions over one-shot extraction.
+- **Continuous by default:** supports supervised long-running collection and a `--once` mode for bounded runs.
 - **Two-phase retrieval:** first collect candidate app IDs from search, then hydrate metadata per app ID for accurate filtering.
 - **Buffered writes:** accumulate `BATCH_SIZE` app IDs before persistence to reduce file and network write churn.
 - **Deduplication-first mindset:** previously seen IDs are loaded from local output and Google Sheets before each run.
 - **Fail-soft network strategy:** API exceptions are swallowed per task to keep the pipeline progressing.
 
 > [!IMPORTANT]
-> This utility intentionally trades strict observability for resilience: recoverable API errors are ignored in worker tasks to avoid stopping collection.
+> Individual request errors do not stop collection; failures are summarized by operation and exception type at the end of each cycle.
 
 ### Pipeline Diagram
 
@@ -98,7 +99,7 @@ A high-throughput Python game discovery utility that continuously scrapes Google
 flowchart TD
     A[Start process] --> B[Load seen app IDs from games.txt]
     B --> C{Google Sheets enabled?}
-    C -- Yes --> D[Load existing URLs from column B]
+    C -- Yes --> D[Load existing URLs from column A]
     C -- No --> E[Generate randomized queries]
     D --> E
     E --> F[Run search queries across locales in parallel]
@@ -111,7 +112,7 @@ flowchart TD
     L -- No --> M[Continue loop]
     L -- Yes --> N[Write URLs to games.txt]
     N --> O{Google Sheets writer active?}
-    O -- Yes --> P[Append deduplicated URLs to column B]
+    O -- Yes --> P[Append deduplicated URLs to column A]
     O -- No --> M
     P --> M
     M --> E
@@ -142,23 +143,20 @@ pip install -r requirements.txt
 
 ## Testing
 
-This repository currently does not ship a formal unit/integration test suite. Use the following baseline checks:
+Run the unit tests and syntax checks with:
 
 ```bash
-python -m compileall main.py settings.py sheet.py
-python main.py
+python -m unittest discover -s tests -v
+python -m compileall main.py settings.py sheet.py tests
 ```
 
-Recommended local quality gates (if you add tooling):
+Use a single discovery cycle for a bounded runtime check:
 
 ```bash
-pip install ruff pytest
-ruff check .
-pytest
+python main.py --once --no-sheets
 ```
 
-> [!NOTE]
-> `python main.py` is both a runtime smoke test and the primary operational entrypoint.
+The default invocation runs continuously. Use `--no-sheets` to skip Google Sheets authentication.
 
 ## Deployment
 
@@ -208,26 +206,28 @@ A minimal container strategy:
 python main.py
 ```
 
+Run one cycle and exit, or disable Sheets integration:
+
+```bash
+python main.py --once
+python main.py --no-sheets
+```
+
 ### Programmatic Example
 
 ```python
 from pathlib import Path
 
 import settings
-from main import collect_candidates, iter_games, load_existing, append_links, PLAY_URL
+from main import append_links, discover_by_search, iter_games, load_existing
 
 output = Path(settings.OUTPUT_FILE)
-seen = load_existing(output)  # Load existing app IDs from saved links
-
-# Discover candidate app IDs using randomized queries and locale fan-out
-candidates = collect_candidates(seen)
-
-# Filter candidates by game category + install bounds, then persist
-selected_ids = [app_id for app_id in iter_games(candidates) if app_id not in seen]
+seen = load_existing(output)
+candidates = discover_by_search(seen, token_pool=[])
+selected_ids = [app_id for app_id, _details in iter_games(candidates) if app_id not in seen]
 append_links(output, selected_ids)
 
 print(f"Saved {len(selected_ids)} URLs")
-print("Example:", PLAY_URL.format(app_id=selected_ids[0]) if selected_ids else "no matches")
 ```
 
 ### Graceful Shutdown

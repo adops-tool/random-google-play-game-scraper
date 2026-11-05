@@ -1,3 +1,3 @@
-google-play-scraper
-gspread
-google-auth
+google-play-scraper>=1.2.7,<2.0
+gspread>=6.0,<7.0
+google-auth>=2.0,<3.0

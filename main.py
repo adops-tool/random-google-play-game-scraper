@@ -1,26 +1,30 @@
-# main.py
-import re
+import argparse
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import sys
+import threading
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Iterable, Iterator, TypeVar
 from urllib.parse import parse_qs, urlsplit
 
-from google_play_scraper import app as get_app_details
-from google_play_scraper import search
-
 import settings
+
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+_NETWORK_FAILURES: Counter[str] = Counter()
+_NETWORK_FAILURES_LOCK = threading.Lock()
 
 
 PLAY_URL = "https://play.google.com/store/apps/details?id={app_id}"
 
 # ---------------------------------------------------------------------------
-# Stopwords (TASK 6)
+# Query token filtering
 # ---------------------------------------------------------------------------
-# Significantly expanded. Keeps generic English fillers, app/store boilerplate
-# ("free", "edition", "update", "experience"), generic gaming jargon
-# ("level", "score", "gameplay"), and small/junk tokens out of the dynamic
-# token pool so extracted queries actually carry signal.
+# Exclude common filler and store terminology from dynamically generated queries.
 STOPWORDS = {
     # Articles, pronouns, conjunctions, prepositions
     "the", "and", "for", "with", "your", "from", "this", "that", "they",
@@ -73,27 +77,16 @@ TOKEN_RESET_EVERY = 15
 
 
 # ---------------------------------------------------------------------------
-# Query generation (TASKS 3 + 4)
+# Query generation
 # ---------------------------------------------------------------------------
-# Replaces the prior random_query() that produced "letters/syllable/double_syllable".
-# Now draws from the curated SEED_WORDS list — every query is at least a real
-# word — and occasionally combines 2-3 tokens into a long-tail phrase to dodge
-# popular single-word results that exceed MAX_INSTALLS.
-
-# SEED_WORDS contains a few accidental repeats ("tower", "stack", "shoot", ...)
-# which would make random.choice() favour them. Dedupe once at import, keeping
-# the original order so the wordlist stays readable/editable in settings.py.
+# Build broad and long-tail searches from the curated seed vocabulary.
+# Preserve source order while removing duplicate terms from configuration.
 SEED_POOL: tuple[str, ...] = tuple(dict.fromkeys(settings.SEED_WORDS))
 
 
 @contextmanager
 def _pool(workers: int | None = None):
-    """Thread pool that drops queued work on Ctrl+C instead of draining it.
-
-    A plain `with ThreadPoolExecutor(...)` blocks on exit until every queued
-    future has run, so interrupting a cycle with hundreds of pending requests
-    could take minutes. Here only the in-flight requests finish.
-    """
+    """Cancel queued work on interruption without waiting for network calls."""
     executor = ThreadPoolExecutor(max_workers=workers or settings.WORKERS)
     try:
         yield executor
@@ -101,21 +94,73 @@ def _pool(workers: int | None = None):
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _completed_futures(
+    executor: ThreadPoolExecutor,
+    function: Callable[[_T], _R],
+    items: Iterable[_T],
+) -> Iterator[tuple[_T, Future[_R]]]:
+    """Yield results as they finish while keeping the number of queued tasks bounded."""
+    iterator = iter(items)
+    pending: dict[Future[_R], _T] = {}
+    limit = max(1, settings.WORKERS) * 2
+
+    def submit_next() -> bool:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return False
+        pending[executor.submit(function, item)] = item
+        return True
+
+    for _ in range(limit):
+        if not submit_next():
+            break
+
+    while pending:
+        completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in completed:
+            item = pending.pop(future)
+            yield item, future
+            submit_next()
+
+
 _progress_width = 0
+_progress_enabled = getattr(sys.stdout, "isatty", lambda: False)()
 
 
 def _progress(text: str, end: bool = False) -> None:
-    """Single-line progress output, padded so shorter lines don't leave debris."""
+    """Render an in-place progress line in terminals and concise lines in logs."""
     global _progress_width
-    print(text.ljust(_progress_width), end="\n" if end else "\r", flush=True)
-    _progress_width = 0 if end else max(_progress_width, len(text))
+    if _progress_enabled:
+        print(text.ljust(_progress_width), end="\n" if end else "\r", flush=True)
+        _progress_width = 0 if end else max(_progress_width, len(text))
+    elif end:
+        print(text, flush=True)
 
 
 def _line(text: str) -> None:
-    """Print a normal line, overwriting any progress line left hanging."""
+    """Print a normal line, clearing any in-place progress display first."""
     global _progress_width
-    print(text.ljust(_progress_width))
+    if _progress_enabled:
+        print(text.ljust(_progress_width))
+    else:
+        print(text)
     _progress_width = 0
+
+
+def _record_network_failure(operation: str, error: Exception) -> None:
+    key = f"{operation}/{type(error).__name__}"
+    with _NETWORK_FAILURES_LOCK:
+        _NETWORK_FAILURES[key] += 1
+
+
+def _report_network_failures() -> None:
+    with _NETWORK_FAILURES_LOCK:
+        failures = dict(_NETWORK_FAILURES)
+        _NETWORK_FAILURES.clear()
+    if failures:
+        summary = ", ".join(f"{name}: {count}" for name, count in sorted(failures.items()))
+        _line(f"  Network failures this cycle: {summary}")
 
 
 def random_query() -> str:
@@ -144,29 +189,33 @@ def parse_installs(value) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Network primitives — every call swallows exceptions and returns an empty /
-# None result so a transient timeout or rate-limit never crashes the main loop.
+# Network access
 # ---------------------------------------------------------------------------
+# Keep individual request failures isolated and report aggregate counts per cycle.
 def fetch_search(query: str, lang: str, country: str, limit: int) -> list:
     try:
+        from google_play_scraper import search
+
         return search(query, lang=lang, country=country, n_hits=limit)
-    except Exception:
+    except Exception as error:
+        _record_network_failure("search", error)
         return []
 
 
 def fetch_details(app_id: str, lang: str = "en", country: str = "us") -> dict | None:
     try:
+        from google_play_scraper import app as get_app_details
+
         return get_app_details(app_id, lang=lang, country=country)
-    except Exception:
+    except Exception as error:
+        _record_network_failure("details", error)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Token extraction (TASK 6)
+# Token extraction
 # ---------------------------------------------------------------------------
-# Stricter validation: alphabetic-only, 4-15 letters, lowercase, not in
-# the (now much larger) stopword set. Numbers, punctuation, and very short
-# or absurdly long strings never enter the pool.
+# Restrict search tokens to useful alphabetic terms and exclude stopwords.
 _VALID_TOKEN = re.compile(r"^[a-z]{4,15}$")
 
 
@@ -175,10 +224,12 @@ def is_valid_token(word: str) -> bool:
 
 
 def tokens_of(details: dict) -> tuple[str, ...]:
-    """Unique valid tokens from a listing's title + summary, in order."""
-    text = (details.get("title") or "") + " " + (details.get("summary") or "")
-    words = (w.lower() for w in re.findall(r"[A-Za-z]+", text))
-    return tuple(dict.fromkeys(w for w in words if is_valid_token(w)))
+    """Return unique valid tokens from a listing's title and summary."""
+    title = details.get("title")
+    summary = details.get("summary")
+    text = f"{title if isinstance(title, str) else ''} {summary if isinstance(summary, str) else ''}"
+    words = (word.lower() for word in re.findall(r"[A-Za-z]+", text))
+    return tuple(dict.fromkeys(word for word in words if is_valid_token(word)))
 
 
 def extract_tokens(
@@ -201,10 +252,9 @@ def extract_tokens(
 
     if missing:
         with _pool() as executor:
-            futures = {executor.submit(fetch_details, aid): aid for aid in missing}
-            for future in as_completed(futures):
+            for app_id, future in _completed_futures(executor, fetch_details, missing):
                 details = future.result()
-                token_cache[futures[future]] = tokens_of(details) if details else ()
+                token_cache[app_id] = tokens_of(details) if details else ()
 
     new_tokens: list[str] = []
     for aid in sample:
@@ -228,22 +278,26 @@ def _run_search_tasks(
 ) -> list[str]:
     if not tasks:
         return []
-    n_hits = limit or settings.SEARCH_LIMIT
+    n_hits = settings.SEARCH_LIMIT if limit is None else limit
+    if n_hits < 1:
+        return []
     total = len(tasks)
     done = 0
     if label:
         _progress(f"  {label}: 0/{total}")
 
-    ids: dict[str, None] = {}  # ordered set — dedupe as we go
+    ids: dict[str, None] = {}
+
+    def search_task(task: tuple[str, str, str]) -> list:
+        return fetch_search(task[0], task[1], task[2], n_hits)
+
     with _pool() as executor:
-        futures = [
-            executor.submit(fetch_search, q, lang, country, n_hits)
-            for q, lang, country in tasks
-        ]
-        for future in as_completed(futures):
+        for _task, future in _completed_futures(executor, search_task, tasks):
             for item in future.result():
+                if not isinstance(item, dict):
+                    continue
                 aid = item.get("appId")
-                if aid and aid not in seen:
+                if isinstance(aid, str) and _APP_ID.fullmatch(aid) and aid not in seen:
                     ids[aid] = None
             done += 1
             if label:
@@ -252,11 +306,11 @@ def _run_search_tasks(
 
 
 # ---------------------------------------------------------------------------
-# DISCOVERY ROUTINES (modular per requirements)
+# Discovery routines
 # ---------------------------------------------------------------------------
 
 def discover_by_search(seen: set[str], token_pool: list[str]) -> list[str]:
-    """Primary keyword-search discovery (TASKS 3 + 4 + 7).
+    """Discover candidates through randomized keyword searches.
 
     Builds queries from a 50/50 mix of (a) dynamic tokens harvested from
     titles/summaries of already-found games and (b) random_query() draws from
@@ -270,13 +324,20 @@ def discover_by_search(seen: set[str], token_pool: list[str]) -> list[str]:
     consumed: list[str] = []
     while token_pool and len(consumed) < half:
         consumed.append(token_pool.pop())
-    pool_queries = set(consumed)
-
-    rand_queries = {random_query() for _ in range(settings.QUERIES_PER_RUN - len(pool_queries))}
-    queries = pool_queries | rand_queries
+    queries = list(dict.fromkeys(consumed))
+    query_set = set(queries)
+    target = max(0, settings.QUERIES_PER_RUN)
+    attempts = 0
+    max_attempts = max(100, target * 10)
+    while len(queries) < target and attempts < max_attempts:
+        attempts += 1
+        query = random_query()
+        if query not in query_set:
+            query_set.add(query)
+            queries.append(query)
 
     locales = random.sample(settings.SEARCH_LOCALES, k=min(4, len(settings.SEARCH_LOCALES)))
-    tasks = [(q, lang, country) for q in queries for lang, country in locales]
+    tasks = [(query, lang, country) for query in queries for lang, country in locales]
 
     return _run_search_tasks(tasks, seen, label="search")
 
@@ -286,27 +347,36 @@ def _spider_locales() -> list[tuple[str, str]]:
 
 
 def developer_queries(app_details: dict) -> list[str]:
-    """Queries for more-by-this-developer spidering (TASK 1).
+    """Return the query used to find other listings from the same developer.
 
     google-play-scraper has no first-class developer-listing endpoint, so we
     approximate: search the developer's name and verify each candidate's
     `developerId` afterwards (see discover_by_spider).
     """
-    if not app_details.get("developer") or not app_details.get("developerId"):
+    developer = app_details.get("developer")
+    developer_id = app_details.get("developerId")
+    if (
+        not isinstance(developer, str)
+        or not developer.strip()
+        or not isinstance(developer_id, str)
+        or not developer_id
+    ):
         return []
-    return [app_details["developer"]]
+    return [developer.strip()]
 
 
 def similar_queries(app_details: dict) -> list[str]:
-    """Queries for similar / related apps expansion (TASK 2).
+    """Build search queries for listings in the same genre and title niche.
 
     google-play-scraper does not expose a `similar(app_id)` endpoint either, so
     we approximate it: take the most distinctive non-stopword tokens from the
     matched game's title and pair them with its `genre`. Searching that
     combination tightly clusters games in the same niche.
     """
-    title = app_details.get("title") or ""
-    genre = (app_details.get("genre") or "").lower().strip()
+    title_value = app_details.get("title")
+    genre_value = app_details.get("genre")
+    title = title_value if isinstance(title_value, str) else ""
+    genre = genre_value.lower().strip() if isinstance(genre_value, str) else ""
 
     title_tokens = [
         t.lower()
@@ -353,13 +423,11 @@ def discover_by_spider(matched: list[tuple[str, dict]], seen: set[str]) -> tuple
     dev_raw = dev_raw[: settings.SPIDER_LIMIT * max(1, len(matched))]
     if dev_raw:
         with _pool() as executor:
-            futures = {executor.submit(fetch_details, aid): aid for aid in dev_raw}
-            for future in as_completed(futures):
-                aid = futures[future]
-                d = future.result()
-                if d and d.get("developerId") in developer_ids:
+            for aid, future in _completed_futures(executor, fetch_details, dev_raw):
+                details = future.result()
+                if details and details.get("developerId") in developer_ids:
                     candidates[aid] = None
-                    prefetched[aid] = d
+                    prefetched[aid] = details
 
     # Wave 2 — similar-niche searches; no verification needed.
     for aid in _run_search_tasks(list(sim_tasks), seen, limit=settings.SPIDER_LIMIT):
@@ -369,15 +437,15 @@ def discover_by_spider(matched: list[tuple[str, dict]], seen: set[str]) -> tuple
 
 
 def discover_by_category(seen: set[str]) -> list[str]:
-    """Category / top-chart discovery (TASK 5).
+    """Discover candidates through game-category seed searches.
 
     Iterates the GAME_* category map in settings, picks one (sometimes two)
     seed keyword per category, and runs them across multiple locales. Surfaces
     trending titles in each genre that single-token text search rarely hits.
     """
-    queries: set[str] = set()
+    queries: dict[str, None] = {}
     for keywords in settings.CATEGORY_SEEDS.values():
-        queries.add(random.choice(keywords))
+        queries.setdefault(random.choice(keywords), None)
     # Add a "new" suffix variant for a subset to bias toward fresh listings —
     # standing in for the missing top-new-free chart endpoint.
     sample_cats = random.sample(
@@ -385,10 +453,10 @@ def discover_by_category(seen: set[str]) -> list[str]:
         k=min(5, len(settings.CATEGORY_SEEDS)),
     )
     for keywords in sample_cats:
-        queries.add(f"{random.choice(keywords)} new")
+        queries.setdefault(f"{random.choice(keywords)} new", None)
 
     locales = random.sample(settings.SEARCH_LOCALES, k=min(4, len(settings.SEARCH_LOCALES)))
-    tasks = [(q, lang, country) for q in queries for lang, country in locales]
+    tasks = [(query, lang, country) for query in queries for lang, country in locales]
     return _run_search_tasks(tasks, seen, label="category")
 
 
@@ -397,8 +465,10 @@ def discover_by_category(seen: set[str]) -> list[str]:
 # without a second details fetch.
 # ---------------------------------------------------------------------------
 def is_wanted(details: dict) -> bool:
-    genre = (details.get("genre") or "").lower()
-    genre_id = (details.get("genreId") or "").upper()
+    genre_value = details.get("genre")
+    genre_id_value = details.get("genreId")
+    genre = genre_value.lower() if isinstance(genre_value, str) else ""
+    genre_id = genre_id_value.upper() if isinstance(genre_id_value, str) else ""
     if "game" not in genre and not genre_id.startswith("GAME"):
         return False
 
@@ -418,22 +488,23 @@ def iter_games(app_ids: list[str], prefetched: dict[str, dict] | None = None):
     anyway) so the same page isn't downloaded twice in one cycle.
     """
     prefetched = prefetched or {}
+    app_ids = list(dict.fromkeys(app_ids))
     total = len(app_ids)
-    done = len(prefetched.keys() & set(app_ids))
+    done = 0
     found = 0
-    _progress(f"  details: {done}/{total}")
+    _progress(f"  details: 0/{total}")
 
     for app_id in app_ids:
         details = prefetched.get(app_id)
-        if details and is_wanted(details):
-            found += 1
-            yield app_id, details
+        if details is not None:
+            done += 1
+            if is_wanted(details):
+                found += 1
+                yield app_id, details
 
-    pending = [aid for aid in app_ids if aid not in prefetched]
+    pending = [app_id for app_id in app_ids if app_id not in prefetched]
     with _pool() as executor:
-        futures = {executor.submit(fetch_details, aid): aid for aid in pending}
-        for future in as_completed(futures):
-            app_id = futures[future]
+        for app_id, future in _completed_futures(executor, fetch_details, pending):
             details = future.result()
             done += 1
             _progress(f"  details: {done}/{total} (matched: {found})")
@@ -446,12 +517,14 @@ def iter_games(app_ids: list[str], prefetched: dict[str, dict] | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Persistence helpers (unchanged behavior)
+# Persistence helpers
 # ---------------------------------------------------------------------------
 _APP_ID = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 
 
 def _app_id_from_url(value: str) -> str | None:
+    if not isinstance(value, str):
+        return None
     try:
         parsed = urlsplit(value.strip())
     except ValueError:
@@ -471,7 +544,10 @@ def load_existing(path: Path) -> set[str]:
 
 
 def append_links(path: Path, app_ids: list[str]) -> None:
-    valid_ids = [app_id for app_id in app_ids if _APP_ID.fullmatch(app_id)]
+    valid_ids = list(dict.fromkeys(
+        app_id for app_id in app_ids
+        if isinstance(app_id, str) and _APP_ID.fullmatch(app_id)
+    ))
     if not valid_ids:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,39 +555,76 @@ def append_links(path: Path, app_ids: list[str]) -> None:
         f.writelines(PLAY_URL.format(app_id=app_id) + "\n" for app_id in valid_ids)
 
 
-def init_sheet():
-    if not (settings.GOOGLE_SHEET_ENABLED and settings.GOOGLE_SHEET_URL):
+def init_sheet(enabled: bool = True):
+    if not (enabled and settings.GOOGLE_SHEET_ENABLED and settings.GOOGLE_SHEET_URL):
         return None
     try:
         from sheet import SheetWriter
+
         writer = SheetWriter(
             settings.GOOGLE_SHEET_URL,
             settings.SERVICE_ACCOUNT_FILE,
             settings.GOOGLE_SHEET_TAB,
         )
-        print(f"Google Sheet: {len(writer.existing)} rows, next A{writer.next_row}")
+        print(f"Google Sheet: {len(writer.existing)} existing values, next row {writer.next_row}")
         return writer
-    except Exception as e:
-        print(f"Google Sheet disabled (error): {e}")
+    except Exception as error:
+        print(f"Google Sheets integration unavailable ({type(error).__name__}). Local output remains enabled.")
         return None
+
+
+def _validate_settings() -> None:
+    if settings.WORKERS < 1:
+        raise ValueError("WORKERS must be greater than zero.")
+    if settings.BATCH_SIZE < 1:
+        raise ValueError("BATCH_SIZE must be greater than zero.")
+    if settings.QUERIES_PER_RUN < 0 or settings.SEARCH_LIMIT < 1:
+        raise ValueError("Query count must be non-negative and search limit must be positive.")
+    if settings.MIN_INSTALLS < 0 or settings.MAX_INSTALLS < 0:
+        raise ValueError("Install thresholds cannot be negative.")
+    if settings.MAX_INSTALLS and settings.MAX_INSTALLS < settings.MIN_INSTALLS:
+        raise ValueError("MAX_INSTALLS must be zero or greater than or equal to MIN_INSTALLS.")
+    if settings.CATEGORY_INTERVAL < 0:
+        raise ValueError("CATEGORY_INTERVAL cannot be negative.")
+    if settings.SPIDER_ENABLED and settings.SPIDER_LIMIT < 1:
+        raise ValueError("SPIDER_LIMIT must be greater than zero when spidering is enabled.")
+    if settings.QUERIES_PER_RUN and (not SEED_POOL or not settings.SEARCH_LOCALES):
+        raise ValueError("Seed words and search locales are required when searching is enabled.")
 
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-def main() -> None:
+def main(max_cycles: int | None = None, use_sheets: bool = True) -> None:
+    _validate_settings()
+    if max_cycles is not None and max_cycles < 1:
+        raise ValueError("max_cycles must be greater than zero when provided.")
+
     output = Path(settings.OUTPUT_FILE)
     seen = load_existing(output)
 
-    sheet = init_sheet()
+    sheet = init_sheet(enabled=use_sheets)
     if sheet:
-        for url in sheet.existing:
-            app_id = _app_id_from_url(url)
-            if app_id:
-                seen.add(app_id)
+        sheet_ids = {
+            app_id for url in sheet.existing
+            if (app_id := _app_id_from_url(url))
+        }
+        seen.update(sheet_ids)
+
+        local_links = [PLAY_URL.format(app_id=app_id) for app_id in load_existing(output)]
+        missing_links = [link for link in local_links if link not in sheet.existing]
+        for offset in range(0, len(missing_links), 500):
+            try:
+                sheet.append(missing_links[offset:offset + 500])
+            except Exception as error:
+                print(f"Google Sheets recovery sync failed ({type(error).__name__}); it will retry on a later run.")
+                break
+        else:
+            if missing_links:
+                print(f"Google Sheets recovery sync: {len(missing_links)} local links checked.")
 
     print(f"Already saved: {len(seen)}")
-    print(f"Writing to {output}{' + Google Sheet' if sheet else ''}. Stop with Ctrl+C.\n")
+    print(f"Writing to {output}{' + Google Sheets' if sheet else ''}. Stop with Ctrl+C.\n")
 
     token_pool: list[str] = []
     seen_tokens: set[str] = set(STOPWORDS)
@@ -525,23 +638,26 @@ def main() -> None:
 
     def flush() -> None:
         nonlocal total_saved
-        if not buffer:
+        buffered_count = len(buffer)
+        if buffered_count:
+            append_links(output, buffer)
+            if sheet:
+                sheet_backlog.extend(PLAY_URL.format(app_id=app_id) for app_id in buffer)
+            total_saved += buffered_count
+            buffer.clear()
+
+        if not buffered_count and not (sheet and sheet_backlog):
             return
-        append_links(output, buffer)
-        msg = f"  + txt: {len(buffer)}"
-        if sheet:
-            # Carry links from an earlier failed write; sheet.append() dedupes,
-            # so retrying can never duplicate a row.
-            sheet_backlog.extend(PLAY_URL.format(app_id=aid) for aid in buffer)
+
+        message = f"  + txt: {buffered_count}"
+        if sheet and sheet_backlog:
             try:
                 added = sheet.append(sheet_backlog)
                 sheet_backlog.clear()
-                msg += f", sheet: {added}"
-            except Exception as e:
-                msg += f", sheet error ({len(sheet_backlog)} queued for retry): {e}"
-        total_saved += len(buffer)
-        _line(msg + f" (session total: {total_saved})")
-        buffer.clear()
+                message += f", sheet: {added}"
+            except Exception as error:
+                message += f", sheet retry pending ({len(sheet_backlog)} links; {type(error).__name__})"
+        _line(f"{message} (session total: {total_saved})")
 
     def process(candidates: list[str], prefetched: dict[str, dict] | None = None) -> list[tuple[str, dict]]:
         """Run candidates through filtering, save matches, return matched details."""
@@ -561,7 +677,7 @@ def main() -> None:
         return matched
 
     try:
-        while True:
+        while max_cycles is None or cycle < max_cycles:
             cycle += 1
 
             # Periodic token-filter reset so games found earlier can re-contribute
@@ -591,11 +707,11 @@ def main() -> None:
                     merged = dict.fromkeys(search_candidates)
                     merged.update(dict.fromkeys(cat_candidates))
                     search_candidates = list(merged)
-                except Exception as e:
-                    # Never let one failed routine kill the loop.
-                    print(f"  category discovery error: {e}")
+                except Exception as error:
+                    print(f"  Category discovery failed ({type(error).__name__}); continuing.")
 
             if not search_candidates:
+                _report_network_failures()
                 continue
 
             # 3. Filter primary candidates
@@ -605,22 +721,39 @@ def main() -> None:
             if settings.SPIDER_ENABLED and matched:
                 try:
                     spider_pool, spider_details = discover_by_spider(matched, seen)
-                except Exception as e:
-                    # Never let one failed routine kill the loop.
-                    print(f"  spider discovery error: {e}")
+                except Exception as error:
+                    print(f"  Spider discovery failed ({type(error).__name__}); continuing.")
                     spider_pool, spider_details = [], {}
 
                 if spider_pool:
                     print(f"  spider candidates: {len(spider_pool)}")
-                    # depth=1 only — matches found via spidering are NOT spidered
-                    # again this cycle, preventing runaway expansion.
+                    # Spider-discovered matches are not expanded again during the same cycle.
                     process(spider_pool, spider_details)
+
+            _report_network_failures()
 
     except KeyboardInterrupt:
         print("\nStopping...")
+    finally:
         flush()
         print(f"Done. Session total: {total_saved}.")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Discover and save Google Play games.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single discovery cycle and exit.",
+    )
+    parser.add_argument(
+        "--no-sheets",
+        action="store_true",
+        help="Skip Google Sheets authentication and synchronization.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    arguments = _parse_args()
+    main(max_cycles=1 if arguments.once else None, use_sheets=not arguments.no_sheets)
