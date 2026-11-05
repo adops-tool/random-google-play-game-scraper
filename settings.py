@@ -1,9 +1,7 @@
-# settings.py
 # ---------------------------------------------------------------------------
-# Install bounds — only games whose installs fall in [MIN_INSTALLS, MAX_INSTALLS]
-# are persisted. Tightened bounds target the indie / mid-tier "long tail" rather
-# than blockbuster titles that show up on every popular query.
+# Install-count filters
 # ---------------------------------------------------------------------------
+# Persist listings whose install count falls within the configured range.
 MIN_INSTALLS = 500_000
 MAX_INSTALLS = 999_000_000
 
@@ -36,11 +34,9 @@ GOOGLE_SHEET_TAB = 0
 SERVICE_ACCOUNT_FILE = "service_account.json"
 
 # ---------------------------------------------------------------------------
-# Geographic locales (TASK 7)
+# Search locales
 # ---------------------------------------------------------------------------
-# Broader array — original Tier-1 markets plus soft-launch / Tier-2/3 markets
-# (PH, ID, BR, IN, AU, CA, MX, AR, etc.) where publishers commonly stage
-# regional releases before global launch.
+# Include major markets and regional launch territories to broaden coverage.
 SEARCH_LOCALES = [
     # English-speaking core + soft-launch markets
     ("en", "us"), ("en", "gb"), ("en", "ca"), ("en", "au"), ("en", "nz"),
@@ -63,13 +59,10 @@ SEARCH_LOCALES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Seed wordlist (TASK 3)
+# Search seed vocabulary
 # ---------------------------------------------------------------------------
-# Replaces random letter/syllable generation. Mix of (a) gaming-domain terms
-# that map directly to genre clusters, (b) common English nouns/adjectives that
-# appear in casual titles, and (c) thematic words that surface niche subgenres.
-# Used for both single-word queries and 2-3 word "long-tail" combinations
-# (TASK 4).
+# Combine genre terms, common title words, and thematic vocabulary for broad
+# and long-tail query generation.
 SEED_WORDS = [
     # --- Gaming genres / mechanics ---
     "idle", "tycoon", "merge", "craft", "rpg", "mmo", "moba", "shooter",
@@ -133,7 +126,7 @@ SEED_WORDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Category seeds (TASK 5)
+# Category search seeds
 # ---------------------------------------------------------------------------
 # google-play-scraper does not expose a top-charts-by-category endpoint, so
 # we approximate it: each Google Play game category maps to a handful of

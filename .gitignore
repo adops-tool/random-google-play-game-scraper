@@ -1,2 +1,6 @@
 service_account.json
 settings.py
+
+__pycache__/
+*.py[cod]
+.venv/
